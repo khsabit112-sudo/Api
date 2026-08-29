@@ -1,249 +1,677 @@
+/**
+ * HTML-to-APK Compilation Service
+ * -----------------------------------------------------------------------
+ * Node.js + Express + Docker backend that decompiles a base.apk template,
+ * injects a user's HTML app + icon + app name, recompiles with apktool,
+ * signs with uber-apk-signer, and serves the result for download.
+ *
+ * Designed to run on Render's free tier (512MB RAM) -> single-slot queue.
+ * -----------------------------------------------------------------------
+ */
+
+'use strict';
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const fse = require('fs-extra');
 const path = require('path');
-const fs = require('fs');
-const { execSync } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
+const { spawn } = require('child_process');
+const sharp = require('sharp');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const VALID_API_KEY = "FFX_SECRET_API_KEY_2026";
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const PORT = process.env.PORT || 10000;
+const API_KEY = process.env.API_KEY || 'FFX_SECRET_API_KEY_2026';
 
-// ডিকম্পাইলে মেমরি খরচের কারণে একসাথে ১টি বিল্ড প্রসেস চলবে
-const MAX_CONCURRENT_JOBS = 1;
-let activeJobsCount = 0;
-const jobQueue = [];
-const jobs = {};
+const ROOT_DIR = __dirname;
+const BASE_APK_PATH = path.join(ROOT_DIR, 'base.apk');
+const UPLOADS_DIR = path.join(ROOT_DIR, 'uploads');
+const BUILDS_DIR = path.join(ROOT_DIR, 'builds');
+const WORKSPACE_DIR = path.join(ROOT_DIR, 'workspace');
 
-// ── CORS সেটিংস ──
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'x-api-key']
-}));
+const APKTOOL_BIN = process.env.APKTOOL_BIN || '/usr/local/bin/apktool';
+const APKTOOL_JAR = process.env.APKTOOL_JAR || '/usr/local/bin/apktool.jar';
+const SIGNER_JAR = process.env.SIGNER_JAR || '/usr/local/bin/uber-apk-signer.jar';
 
-app.use(express.json());
-
-// ডিরেক্টরি সেটআপ
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const BUILDS_DIR = path.join(__dirname, 'builds');
-const BASE_APK_PATH = path.join(__dirname, 'base.apk');
-
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-if (!fs.existsSync(BUILDS_DIR)) fs.mkdirSync(BUILDS_DIR, { recursive: true });
-
-// Multer ফাইল আপলোড কনফিগারেশন
-const upload = multer({
-    storage: multer.diskStorage({
-        destination: (req, file, cb) => {
-            const folder = path.join(UPLOAD_DIR, req.uploadJobId);
-            if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
-            cb(null, folder);
-        },
-        filename: (req, file, cb) => cb(null, file.originalname)
-    }),
-    limits: { fileSize: 25 * 1024 * 1024 }
-});
-
-// API Key ভেরিফিকেশন মিডলওয়্যার
-const verifyApiKey = (req, res, next) => {
-    const key = req.headers['x-api-key'] || req.query.apikey;
-    if (!key || key !== VALID_API_KEY) {
-        return res.status(403).json({ error: 'Unauthorized: Invalid API Key' });
-    }
-    next();
+const MIPMAP_SIZES = {
+  'mipmap-mdpi': 48,
+  'mipmap-hdpi': 72,
+  'mipmap-xhdpi': 96,
+  'mipmap-xxhdpi': 144,
+  'mipmap-xxxhdpi': 192
 };
 
-// ── ১. সার্ভার স্ট্যাটাস পেজ (ড্যাশবোর্ড UI) ──
-app.get('/', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>API Server Status</title>
-        <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
-        <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'JetBrains Mono', monospace; }
-            body { background-color: #0b111e; color: #e2e8f0; min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px; }
-            .card { background: #111a2e; border: 1px solid rgba(0, 255, 136, 0.2); border-radius: 16px; padding: 36px 28px; text-align: center; max-width: 420px; width: 100%; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6); }
-            .title-badge { display: inline-flex; align-items: center; gap: 10px; color: #00ff88; font-size: 1.4rem; font-weight: 700; margin-bottom: 16px; }
-            .status-dot { width: 12px; height: 12px; background-color: #00ff88; border-radius: 50%; box-shadow: 0 0 12px #00ff88; animation: pulse 2s infinite ease-in-out; }
-            @keyframes pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.3); opacity: 0.7; } }
-            .subtitle { color: #94a3b8; font-size: 0.92rem; line-height: 1.6; margin-bottom: 20px; }
-            .badge { display: inline-block; color: #64748b; font-size: 0.8rem; }
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <div class="title-badge"><span class="status-dot"></span><span>API Server Active</span></div>
-            <p class="subtitle">This server is awake and ready for requests.</p>
-            <div class="badge">Secured by FFX API Key</div>
-        </div>
-    </body>
-    </html>
-    `);
-});
+fse.ensureDirSync(UPLOADS_DIR);
+fse.ensureDirSync(BUILDS_DIR);
+fse.ensureDirSync(WORKSPACE_DIR);
 
-// ── ২. /generate এন্ডপয়েন্ট ──
-app.post('/generate', verifyApiKey, (req, res, next) => {
-    req.uploadJobId = uuidv4();
-    next();
-}, upload.fields([
-    { name: 'iconFile', maxCount: 1 },
-    { name: 'htmlFiles', maxCount: 10 }
-]), (req, res) => {
-    const jobId = req.uploadJobId;
-    const { appName } = req.body;
+// ---------------------------------------------------------------------------
+// In-memory job store + single-slot sequential queue
+// ---------------------------------------------------------------------------
+/**
+ * Job shape:
+ * {
+ *   id, appName, status: 'queued'|'processing'|'done'|'error',
+ *   step, progress, error, createdAt, updatedAt,
+ *   apkPath, workDir
+ * }
+ */
+const jobs = new Map();
+const queue = [];
+let isProcessing = false;
 
-    if (!appName) {
-        return res.status(400).send('Application name is required.');
-    }
-
-    jobs[jobId] = {
-        id: jobId,
-        appName,
-        status: 'queued',
-        position: jobQueue.length + 1,
-        message: 'Awaiting available build slot.',
-        createdAt: Date.now()
-    };
-
-    jobQueue.push(jobId);
-    res.json({ jobId });
-    processNextQueueJob();
-});
-
-// ── ৩. কিউ হ্যান্ডলার ──
-function processNextQueueJob() {
-    if (activeJobsCount >= MAX_CONCURRENT_JOBS || jobQueue.length === 0) return;
-
-    const jobId = jobQueue.shift();
-    const job = jobs[jobId];
-    if (!job) return;
-
-    activeJobsCount++;
-    job.status = 'processing';
-    job.position = 0;
-    job.message = 'Decompiling binary APK framework...';
-
-    jobQueue.forEach((id, index) => {
-        if (jobs[id]) jobs[id].position = index + 1;
-    });
-
-    executeBuildPipeline(jobId, job.appName);
+function createJob(appName) {
+  const id = uuidv4();
+  const job = {
+    id,
+    appName,
+    status: 'queued',
+    step: 'Waiting in queue…',
+    progress: 0,
+    error: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    apkPath: null,
+    workDir: path.join(WORKSPACE_DIR, id)
+  };
+  jobs.set(id, job);
+  return job;
 }
 
-// ── ৪. বিল্ড পাইপলাইন (Apktool + Signer) ──
-function executeBuildPipeline(jobId, appName) {
-    const job = jobs[jobId];
-    const workDir = path.join(UPLOAD_DIR, jobId);
-    const decompiledDir = path.join(workDir, 'decompiled');
-    const finalUnsigned = path.join(workDir, 'unsigned.apk');
-    const signedApkPath = path.join(BUILDS_DIR, `${jobId}.apk`);
+function updateJob(id, patch) {
+  const job = jobs.get(id);
+  if (!job) return;
+  Object.assign(job, patch, { updatedAt: new Date().toISOString() });
+}
 
+function enqueue(job, files) {
+  queue.push({ job, files });
+  processQueue();
+}
+
+async function processQueue() {
+  if (isProcessing) return;
+  const next = queue.shift();
+  if (!next) return;
+
+  isProcessing = true;
+  const { job, files } = next;
+
+  try {
+    await runBuildPipeline(job, files);
+  } catch (err) {
+    console.error(`[job ${job.id}] fatal pipeline error:`, err);
+    updateJob(job.id, {
+      status: 'error',
+      step: 'Build failed',
+      error: err && err.message ? err.message : String(err)
+    });
+  } finally {
+    // Cleanup temp workspace + uploaded source files regardless of outcome
     try {
-        if (!fs.existsSync(BASE_APK_PATH)) {
-            throw new Error("base.apk not found on server root!");
-        }
-
-        // ১. Base APK ডিকম্পাইল করা
-        execSync(`apktool d "${BASE_APK_PATH}" -o "${decompiledDir}" -f`, { stdio: 'pipe' });
-
-        // ২. অ্যাপের নাম পরিবর্তন (strings.xml)
-        job.message = 'Configuring application branding...';
-        const stringsPath = path.join(decompiledDir, 'res', 'values', 'strings.xml');
-        if (fs.existsSync(stringsPath)) {
-            let stringsXml = fs.readFileSync(stringsPath, 'utf8');
-            if (stringsXml.includes('name="app_name"')) {
-                stringsXml = stringsXml.replace(/<string name="app_name">.*?<\/string>/, `<string name="app_name">${appName}</string>`);
-                fs.writeFileSync(stringsPath, stringsXml);
-            }
-        }
-
-        // ৩. HTML ফাইল assets ফোল্ডারে যোগ করা
-        job.message = 'Injecting WebView assets...';
-        const assetsDir = path.join(decompiledDir, 'assets');
-        if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir, { recursive: true });
-
-        const files = fs.readdirSync(workDir);
-        files.forEach(fileName => {
-            const filePath = path.join(workDir, fileName);
-            if (fileName.endsWith('.html') || fileName.endsWith('.htm')) {
-                fs.copyFileSync(filePath, path.join(assetsDir, fileName));
-            } else if (fileName.endsWith('.png')) {
-                // অ্যাপ আইকন প্রতিস্থাপন (যদি রিসোর্স ফোল্ডার থাকে)
-                const drawableDir = path.join(decompiledDir, 'res', 'drawable');
-                if (fs.existsSync(drawableDir)) {
-                    fs.copyFileSync(filePath, path.join(drawableDir, 'app_icon.png'));
-                }
-            }
-        });
-
-        // ৪. রিকম্পাইল করা
-        job.message = 'Compiling application binaries...';
-        execSync(`apktool b "${decompiledDir}" -o "${finalUnsigned}"`, { stdio: 'pipe' });
-
-        // ৫. সাইন করা (Uber-APK-Signer)
-        job.message = 'Signing APK package...';
-        execSync(`java -jar /usr/local/bin/uber-apk-signer.jar --apks "${finalUnsigned}" --out "${workDir}" --overwrite`, { stdio: 'pipe' });
-
-        // সাইন করা ফাইলটি builds ফোল্ডারে সরানো
-        fs.copyFileSync(finalUnsigned, signedApkPath);
-
-        job.status = 'done';
-        job.message = 'Build complete and signed!';
-    } catch (err) {
-        console.error("Pipeline Execution Error:", err);
-        job.status = 'error';
-        // আসল এরর আউটপুট ক্লায়েন্টে পাঠানো
-        const errorOutput = err.stderr ? err.stderr.toString() : err.message;
-        job.message = errorOutput || 'Compilation failed during processing.';
-    } finally {
-        // টেম্পোরারি ওয়ার্ক ডিরেক্টরি ডিলিট করা
-        if (fs.existsSync(workDir)) {
-            fs.rmSync(workDir, { recursive: true, force: true });
-        }
-        activeJobsCount--;
-        processNextQueueJob();
+      await fse.remove(job.workDir);
+    } catch (cleanupErr) {
+      console.error(`[job ${job.id}] workspace cleanup failed:`, cleanupErr);
     }
+    try {
+      for (const f of [files.iconFile, ...(files.htmlFiles || [])]) {
+        if (f && f.path) await fse.remove(f.path);
+      }
+    } catch (cleanupErr) {
+      console.error(`[job ${job.id}] upload cleanup failed:`, cleanupErr);
+    }
+
+    isProcessing = false;
+    // Process next item in queue, if any
+    setImmediate(processQueue);
+  }
 }
 
-// ── ৫. /status/:jobId এন্ডপয়েন্ট ──
-app.get('/status/:jobId', verifyApiKey, (req, res) => {
-    const job = jobs[req.params.jobId];
-    if (!job) return res.status(404).json({ error: 'Job not found or expired' });
-    res.json({
-        status: job.status,
-        position: job.position,
-        message: job.message
+// ---------------------------------------------------------------------------
+// Shell helper - spawn a process, capture output, never throw uncaught
+// ---------------------------------------------------------------------------
+function runCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || ROOT_DIR,
+      env: { ...process.env, ...(options.env || {}) },
+      shell: false
     });
-});
 
-// ── ৬. /download/:jobId এন্ডপয়েন্ট ──
-app.get('/download/:jobId', verifyApiKey, (req, res) => {
-    const { jobId } = req.params;
-    const job = jobs[jobId];
-    const apkFilePath = path.join(BUILDS_DIR, `${jobId}.apk`);
+    let stdout = '';
+    let stderr = '';
 
-    if (!fs.existsSync(apkFilePath)) {
-        return res.status(404).send('APK file not found or build failed.');
+    child.stdout.on('data', (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderr += d.toString();
+    });
+
+    child.on('error', (err) => {
+      reject(new Error(`Failed to start "${command}": ${err.message}`));
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr, code });
+      } else {
+        console.error(`[cmd] ${command} ${args.join(' ')} exited with code ${code}`);
+        console.error(`[cmd stderr] ${stderr}`);
+        reject(
+          new Error(
+            `Command "${command} ${args.join(' ')}" exited with code ${code}. ${stderr
+              .split('\n')
+              .slice(-5)
+              .join(' ')}`
+          )
+        );
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// XML helpers
+// ---------------------------------------------------------------------------
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+async function patchAppName(decompiledDir, appName) {
+  const stringsPath = path.join(decompiledDir, 'res', 'values', 'strings.xml');
+  const exists = await fse.pathExists(stringsPath);
+  const safeName = escapeXml(appName);
+
+  if (!exists) {
+    // Extremely unlikely for a valid APK, but guard against a crash anyway.
+    await fse.ensureDir(path.dirname(stringsPath));
+    await fse.writeFile(
+      stringsPath,
+      `<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">${safeName}</string>\n</resources>\n`,
+      'utf8'
+    );
+    return;
+  }
+
+  let xml = await fse.readFile(stringsPath, 'utf8');
+  const appNamePattern = /<string name="app_name">[\s\S]*?<\/string>/;
+
+  if (appNamePattern.test(xml)) {
+    xml = xml.replace(appNamePattern, `<string name="app_name">${safeName}</string>`);
+  } else {
+    xml = xml.replace(
+      '</resources>',
+      `    <string name="app_name">${safeName}</string>\n</resources>`
+    );
+  }
+
+  await fse.writeFile(stringsPath, xml, 'utf8');
+}
+
+// ---------------------------------------------------------------------------
+// Asset injection
+// ---------------------------------------------------------------------------
+async function injectHtmlFiles(decompiledDir, htmlFiles) {
+  const assetsDir = path.join(decompiledDir, 'assets');
+  await fse.ensureDir(assetsDir);
+
+  for (const file of htmlFiles) {
+    const destName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
+    const destPath = path.join(assetsDir, destName);
+    await fse.copy(file.path, destPath);
+  }
+}
+
+async function replaceLauncherIcon(decompiledDir, iconFile) {
+  if (!iconFile) return;
+
+  const resDir = path.join(decompiledDir, 'res');
+  const iconNames = ['ic_launcher.png', 'ic_launcher_round.png'];
+
+  for (const [folder, size] of Object.entries(MIPMAP_SIZES)) {
+    const folderPath = path.join(resDir, folder);
+    const folderExists = await fse.pathExists(folderPath);
+    if (!folderExists) continue;
+
+    for (const iconName of iconNames) {
+      const targetPath = path.join(folderPath, iconName);
+      const targetExists = await fse.pathExists(targetPath);
+      if (!targetExists) continue;
+
+      try {
+        await sharp(iconFile.path)
+          .resize(size, size, { fit: 'cover' })
+          .png()
+          .toFile(targetPath + '.tmp');
+        await fse.move(targetPath + '.tmp', targetPath, { overwrite: true });
+      } catch (resizeErr) {
+        console.error(`Icon resize failed for ${targetPath}, falling back to raw copy:`, resizeErr.message);
+        await fse.copy(iconFile.path, targetPath);
+      }
     }
+  }
 
-    const downloadName = job ? `${job.appName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.apk` : 'app.apk';
-    res.download(apkFilePath, downloadName);
+  // Also cover a flat drawable fallback, if present in the template.
+  const drawableIcon = path.join(resDir, 'drawable', 'ic_launcher.png');
+  if (await fse.pathExists(drawableIcon)) {
+    try {
+      await sharp(iconFile.path).resize(96, 96, { fit: 'cover' }).png().toFile(drawableIcon + '.tmp');
+      await fse.move(drawableIcon + '.tmp', drawableIcon, { overwrite: true });
+    } catch (err) {
+      await fse.copy(iconFile.path, drawableIcon);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Core build pipeline
+// ---------------------------------------------------------------------------
+async function runBuildPipeline(job, files) {
+  const { id } = job;
+  const workDir = job.workDir;
+  const decompiledDir = path.join(workDir, 'decompiled');
+  const unsignedApk = path.join(workDir, 'unsigned.apk');
+
+  await fse.ensureDir(workDir);
+
+  // Step 0: validate base.apk presence
+  updateJob(id, { status: 'processing', step: 'Validating base template…', progress: 5 });
+  const baseExists = await fse.pathExists(BASE_APK_PATH);
+  if (!baseExists) {
+    throw new Error('base.apk was not found in the service root. Place your template APK at /app/base.apk.');
+  }
+
+  // Step 1: decompile
+  updateJob(id, { step: 'Decompiling base APK…', progress: 15 });
+  await runCommand('java', [
+    '-jar',
+    APKTOOL_JAR,
+    'd',
+    BASE_APK_PATH,
+    '-o',
+    decompiledDir,
+    '-f'
+  ]);
+
+  // Step 2: patch app name
+  updateJob(id, { step: 'Setting application name…', progress: 35 });
+  await patchAppName(decompiledDir, job.appName);
+
+  // Step 3: inject HTML assets
+  updateJob(id, { step: 'Injecting HTML app files…', progress: 45 });
+  await injectHtmlFiles(decompiledDir, files.htmlFiles || []);
+
+  // Step 4: replace icon
+  if (files.iconFile) {
+    updateJob(id, { step: 'Replacing launcher icon…', progress: 55 });
+    await replaceLauncherIcon(decompiledDir, files.iconFile);
+  }
+
+  // Step 5: rebuild
+  updateJob(id, { step: 'Recompiling APK…', progress: 70 });
+  await runCommand('java', [
+    '-jar',
+    APKTOOL_JAR,
+    'b',
+    decompiledDir,
+    '-o',
+    unsignedApk
+  ]);
+
+  // Step 6: sign
+  updateJob(id, { step: 'Signing APK…', progress: 88 });
+  await runCommand('java', [
+    '-jar',
+    SIGNER_JAR,
+    '-a',
+    unsignedApk,
+    '--out',
+    workDir,
+    '--allowResign'
+  ]);
+
+  // uber-apk-signer names the output "<input-basename>-aligned-debugSigned.apk"
+  const producedFiles = await fse.readdir(workDir);
+  const signedFileName = producedFiles.find(
+    (f) => f.toLowerCase().includes('signed') && f.toLowerCase().endsWith('.apk')
+  );
+
+  if (!signedFileName) {
+    throw new Error('Signing step completed but no signed APK was found in the output.');
+  }
+
+  const finalApkPath = path.join(BUILDS_DIR, `${id}.apk`);
+  await fse.move(path.join(workDir, signedFileName), finalApkPath, { overwrite: true });
+
+  updateJob(id, {
+    status: 'done',
+    step: 'Build complete',
+    progress: 100,
+    apkPath: finalApkPath
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Express app setup
+// ---------------------------------------------------------------------------
+const app = express();
+
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'x-api-key'],
+    maxAge: 86400
+  })
+);
+app.use(express.json());
+
+// Multer: temp storage in uploads/, sane size limits
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  filename: (req, file, cb) => {
+    const unique = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
+    cb(null, unique);
+  }
 });
 
-// গ্লোবাল এরর হ্যান্ডলার
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 15 * 1024 * 1024, // 15MB per file
+    files: 12
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.fieldname === 'iconFile') {
+      if (file.mimetype === 'image/png') return cb(null, true);
+      return cb(new Error('iconFile must be a PNG image.'));
+    }
+    if (file.fieldname === 'htmlFiles') {
+      const isHtml =
+        file.mimetype === 'text/html' ||
+        file.originalname.toLowerCase().endsWith('.html') ||
+        file.originalname.toLowerCase().endsWith('.htm');
+      if (isHtml) return cb(null, true);
+      return cb(new Error('htmlFiles must be .html files.'));
+    }
+    return cb(null, true);
+  }
+});
+
+function requireApiKey(req, res, next) {
+  const key = req.header('x-api-key');
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ success: false, error: 'Unauthorized: invalid or missing x-api-key header.' });
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// GET / - dark cyber-themed status page
+// ---------------------------------------------------------------------------
+app.get('/', (req, res) => {
+  const activeJobs = [...jobs.values()]
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, 8);
+
+  const rows = activeJobs
+    .map((j) => {
+      const statusColor =
+        j.status === 'done' ? '#39ff88' : j.status === 'error' ? '#ff3b5c' : '#00e5ff';
+      return `
+        <tr>
+          <td>${j.id.slice(0, 8)}…</td>
+          <td>${escapeHtml(j.appName)}</td>
+          <td style="color:${statusColor}">${j.status.toUpperCase()}</td>
+          <td>${escapeHtml(j.step)}</td>
+          <td>${j.progress}%</td>
+        </tr>`;
+    })
+    .join('');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HTML-to-APK Compiler // Status</title>
+<style>
+  :root {
+    --bg: #05070d;
+    --panel: #0b0f1a;
+    --accent: #00e5ff;
+    --accent2: #39ff88;
+    --danger: #ff3b5c;
+    --text: #d7e5ff;
+    --muted: #6c7a99;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(circle at 20% 20%, #0d1626 0%, var(--bg) 55%);
+    color: var(--text);
+    font-family: 'Courier New', Consolas, monospace;
+    min-height: 100vh;
+    padding: 32px 16px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 {
+    font-size: 22px;
+    letter-spacing: 2px;
+    color: var(--accent);
+    text-shadow: 0 0 12px rgba(0,229,255,0.6);
+    margin-bottom: 4px;
+  }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-bottom: 28px;
+  }
+  .card {
+    background: linear-gradient(160deg, var(--panel), #060a12);
+    border: 1px solid rgba(0,229,255,0.25);
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 0 20px rgba(0,229,255,0.05);
+  }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .card .value { color: var(--accent2); font-size: 20px; margin-top: 6px; font-weight: bold; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    text-align: left;
+    color: var(--muted);
+    padding: 8px 6px;
+    border-bottom: 1px solid rgba(0,229,255,0.2);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 1px;
+  }
+  td { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .panel { background: var(--panel); border: 1px solid rgba(0,229,255,0.15); border-radius: 10px; padding: 16px; overflow-x: auto; }
+  .pulse {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent2); box-shadow: 0 0 8px var(--accent2);
+    animation: pulse 1.6s infinite ease-in-out; margin-right: 8px;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .footer { margin-top: 24px; color: var(--muted); font-size: 11px; text-align: center; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>&gt;&gt; HTML_TO_APK_COMPILER</h1>
+    <div class="sub"><span class="pulse"></span>SERVICE ONLINE &mdash; ${new Date().toISOString()}</div>
+
+    <div class="grid">
+      <div class="card"><div class="label">Queue Length</div><div class="value">${queue.length}</div></div>
+      <div class="card"><div class="label">Active Build</div><div class="value">${isProcessing ? 'YES' : 'IDLE'}</div></div>
+      <div class="card"><div class="label">Total Jobs</div><div class="value">${jobs.size}</div></div>
+      <div class="card"><div class="label">Concurrency</div><div class="value">1 SLOT</div></div>
+    </div>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr><th>Job ID</th><th>App Name</th><th>Status</th><th>Step</th><th>Progress</th></tr>
+        </thead>
+        <tbody>
+          ${rows || '<tr><td colspan="5" style="color:var(--muted)">No jobs yet.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="footer">POST /generate &middot; GET /status/:jobId &middot; GET /download/:jobId</div>
+  </div>
+</body>
+</html>`;
+
+  res.set('Content-Type', 'text/html');
+  res.send(html);
+});
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ---------------------------------------------------------------------------
+// POST /generate
+// ---------------------------------------------------------------------------
+app.post(
+  '/generate',
+  requireApiKey,
+  (req, res, next) => {
+    upload.fields([
+      { name: 'iconFile', maxCount: 1 },
+      { name: 'htmlFiles', maxCount: 10 }
+    ])(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({ success: false, error: err.message });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const appName = (req.body.appName || '').trim();
+      if (!appName) {
+        return res.status(400).json({ success: false, error: 'appName is required.' });
+      }
+
+      const htmlFiles = (req.files && req.files.htmlFiles) || [];
+      if (htmlFiles.length === 0) {
+        return res.status(400).json({ success: false, error: 'At least one HTML file is required.' });
+      }
+
+      const iconFile = req.files && req.files.iconFile ? req.files.iconFile[0] : null;
+
+      const job = createJob(appName);
+      enqueue(job, { htmlFiles, iconFile });
+
+      return res.status(202).json({
+        success: true,
+        jobId: job.id,
+        status: job.status,
+        queuePosition: queue.findIndex((q) => q.job.id === job.id) + 1,
+        statusUrl: `/status/${job.id}`,
+        downloadUrl: `/download/${job.id}`
+      });
+    } catch (err) {
+      console.error('POST /generate error:', err);
+      return res.status(500).json({ success: false, error: 'Internal server error while queuing the job.' });
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GET /status/:jobId
+// ---------------------------------------------------------------------------
+app.get('/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, error: 'Job not found.' });
+  }
+
+  const queuePosition = queue.findIndex((q) => q.job.id === job.id);
+
+  return res.json({
+    success: true,
+    jobId: job.id,
+    appName: job.appName,
+    status: job.status,
+    step: job.step,
+    progress: job.progress,
+    error: job.error,
+    queuePosition: queuePosition >= 0 ? queuePosition + 1 : null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    downloadReady: job.status === 'done'
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /download/:jobId
+// ---------------------------------------------------------------------------
+app.get('/download/:jobId', async (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, error: 'Job not found.' });
+  }
+
+  if (job.status !== 'done' || !job.apkPath) {
+    return res.status(409).json({
+      success: false,
+      error: `APK not ready. Current status: ${job.status}.`
+    });
+  }
+
+  const exists = await fse.pathExists(job.apkPath);
+  if (!exists) {
+    return res.status(410).json({ success: false, error: 'Build artifact no longer exists.' });
+  }
+
+  const safeName = job.appName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'app';
+  res.download(job.apkPath, `${safeName}.apk`, (err) => {
+    if (err) {
+      console.error(`[job ${job.id}] download error:`, err);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fallback error handler - guarantees the server never crashes on a bad request
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error('Unhandled Express error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ success: false, error: 'Unexpected server error.' });
+});
+
 process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err);
+  console.error('uncaughtException:', err);
 });
 process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled Rejection:', reason);
+  console.error('unhandledRejection:', reason);
 });
 
 app.listen(PORT, () => {
-    console.log(`Render Compiler Worker running on port ${PORT}`);
+  console.log(`HTML-to-APK service listening on port ${PORT}`);
+  console.log(`Apktool: ${APKTOOL_BIN} / ${APKTOOL_JAR}`);
+  console.log(`Signer:  ${SIGNER_JAR}`);
+  console.log(`Base APK expected at: ${BASE_APK_PATH}`);
 });
