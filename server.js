@@ -224,10 +224,35 @@ async function injectHtmlFiles(decompiledDir, htmlFiles) {
   const assetsDir = path.join(decompiledDir, 'assets');
   await fse.ensureDir(assetsDir);
 
+  // Remove the placeholder index.html shipped in the base template so it
+  // never lingers if, for some reason, nothing gets copied over it below.
+  const placeholderIndex = path.join(assetsDir, 'index.html');
+  if (await fse.pathExists(placeholderIndex)) {
+    await fse.remove(placeholderIndex);
+  }
+
+  let hasIndex = false;
+  const copiedNames = [];
+
   for (const file of htmlFiles) {
     const destName = path.basename(file.originalname).replace(/[^a-zA-Z0-9._-]/g, '_');
     const destPath = path.join(assetsDir, destName);
     await fse.copy(file.path, destPath);
+    copiedNames.push(destName);
+    if (destName.toLowerCase() === 'index.html') {
+      hasIndex = true;
+    }
+  }
+
+  // The WebView shell always loads "file:///android_asset/index.html".
+  // If the user didn't name any uploaded file "index.html", treat the
+  // FIRST uploaded HTML file as the entry point by duplicating it as
+  // index.html (its original name is kept too, so internal links between
+  // pages still work).
+  if (!hasIndex && htmlFiles.length > 0) {
+    const mainFile = htmlFiles[0];
+    const indexDest = path.join(assetsDir, 'index.html');
+    await fse.copy(mainFile.path, indexDest);
   }
 }
 
