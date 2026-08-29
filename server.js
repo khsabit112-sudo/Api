@@ -16,6 +16,7 @@ let activeJobsCount = 0;
 const jobQueue = [];
 const jobs = {};
 
+// ── CORS সেটিংস ──
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -24,6 +25,7 @@ app.use(cors({
 
 app.use(express.json());
 
+// ফোল্ডার প্রস্তুতি
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const BUILDS_DIR = path.join(__dirname, 'builds');
 const BASE_APK_PATH = path.join(__dirname, 'base.apk');
@@ -56,6 +58,7 @@ const verifyApiKey = (req, res, next) => {
     next();
 };
 
+// ── Health Check ──
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -87,6 +90,7 @@ app.get('/', (req, res) => {
     `);
 });
 
+// ── /generate ──
 app.post('/generate', verifyApiKey, (req, res, next) => {
     req.uploadJobId = uuidv4();
     next();
@@ -147,15 +151,18 @@ function executeBuildPipeline(jobId, appName) {
 
     setTimeout(() => {
         try {
-            // যদি base.apk না থাকে তবে হ্যান্ডেল করা
             if (!fs.existsSync(BASE_APK_PATH)) {
-                throw new Error("base.apk not found on server root!");
+                throw new Error("base.apk not found on server root! Please upload base.apk to GitHub.");
             }
 
-            // base.apk লোড করা (AdmZip দিয়ে)
+            const stats = fs.statSync(BASE_APK_PATH);
+            if (stats.size < 10000) {
+                throw new Error("base.apk file is too small or corrupted! Upload a valid APK.");
+            }
+
             const zip = new AdmZip(BASE_APK_PATH);
 
-            // আপলোড করা সব HTML ফাইল assets ফোল্ডারে ঢোকানো
+            // আপলোড করা সব HTML ফাইল assets ফোল্ডারে পাঠানো
             const uploadedFiles = fs.readdirSync(jobFolder);
             uploadedFiles.forEach((fileName) => {
                 const filePath = path.join(jobFolder, fileName);
@@ -164,12 +171,11 @@ function executeBuildPipeline(jobId, appName) {
                 if (fileName.endsWith('.html') || fileName.endsWith('.htm')) {
                     zip.addFile(`assets/${fileName}`, fileData);
                 } else if (fileName.endsWith('.png')) {
-                    // অ্যাপ আইকন রিপ্লেস
                     zip.addFile(`res/drawable/app_icon.png`, fileData);
                 }
             });
 
-            // পুরনো সিগনেচার ডিলিট করা (META-INF)
+            // সিগনেচার সরানো
             const entries = zip.getEntries();
             entries.forEach((entry) => {
                 if (entry.entryName.startsWith("META-INF/")) {
@@ -177,38 +183,45 @@ function executeBuildPipeline(jobId, appName) {
                 }
             });
 
-            // নতুন এপিকে হিসেবে সেভ করা
             zip.writeZip(outputApkPath);
+            job.message = 'APK package assembled successfully.';
+            
+            // কাজ শেষ
+            setTimeout(() => {
+                job.status = 'done';
+                job.message = 'Build complete and ready for download.';
 
-            job.message = 'APK package assembled & signed successfully.';
+                if (fs.existsSync(jobFolder)) {
+                    fs.rmSync(jobFolder, { recursive: true, force: true });
+                }
+
+                activeJobsCount--;
+                processNextQueueJob();
+            }, 2000);
+
         } catch (err) {
-            console.error(err);
+            console.error("Pipeline Error:", err);
             job.status = 'error';
-            job.message = err.message;
+            job.message = err.message || 'Build pipeline crashed';
+
+            if (fs.existsSync(jobFolder)) {
+                fs.rmSync(jobFolder, { recursive: true, force: true });
+            }
+
             activeJobsCount--;
             processNextQueueJob();
-            return;
         }
     }, 3500);
-
-    setTimeout(() => {
-        job.status = 'done';
-        job.message = 'Build complete and ready for download.';
-
-        if (fs.existsSync(jobFolder)) {
-            fs.rmSync(jobFolder, { recursive: true, force: true });
-        }
-
-        activeJobsCount--;
-        processNextQueueJob();
-    }, 5500);
 }
 
+// ── /status/:jobId ──
 app.get('/status/:jobId', verifyApiKey, (req, res) => {
     const { jobId } = req.params;
     const job = jobs[jobId];
 
-    if (!job) return res.status(404).json({ error: 'Job not found' });
+    if (!job) {
+        return res.status(404).json({ error: 'Job not found or expired' });
+    }
 
     res.json({
         status: job.status,
@@ -217,6 +230,7 @@ app.get('/status/:jobId', verifyApiKey, (req, res) => {
     });
 });
 
+// ── /download/:jobId ──
 app.get('/download/:jobId', verifyApiKey, (req, res) => {
     const { jobId } = req.params;
     const job = jobs[jobId];
@@ -228,6 +242,14 @@ app.get('/download/:jobId', verifyApiKey, (req, res) => {
 
     const downloadName = job ? `${job.appName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.apk` : 'app.apk';
     res.download(apkFilePath, downloadName);
+});
+
+// গ্লোবাল এরর হ্যান্ডলার যাতে সার্ভার শাটডাউন না হয়
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection:', reason);
 });
 
 app.listen(PORT, () => {
