@@ -256,43 +256,78 @@ async function injectHtmlFiles(decompiledDir, htmlFiles) {
   }
 }
 
-async function replaceLauncherIcon(decompiledDir, iconFile) {
-  if (!iconFile) return;
+async function findLauncherIconFiles(dir) {
+  const matches = [];
+  const iconNamePattern = /^ic_launcher.*\.(png|webp)$/i;
 
-  const resDir = path.join(decompiledDir, 'res');
-  const iconNames = ['ic_launcher.png', 'ic_launcher_round.png'];
+  async function walk(currentDir) {
+    let entries;
+    try {
+      entries = await fse.readdir(currentDir, { withFileTypes: true });
+    } catch (err) {
+      return; // directory unreadable/missing - skip silently
+    }
 
-  for (const [folder, size] of Object.entries(MIPMAP_SIZES)) {
-    const folderPath = path.join(resDir, folder);
-    const folderExists = await fse.pathExists(folderPath);
-    if (!folderExists) continue;
-
-    for (const iconName of iconNames) {
-      const targetPath = path.join(folderPath, iconName);
-      const targetExists = await fse.pathExists(targetPath);
-      if (!targetExists) continue;
-
-      try {
-        await sharp(iconFile.path)
-          .resize(size, size, { fit: 'cover' })
-          .png()
-          .toFile(targetPath + '.tmp');
-        await fse.move(targetPath + '.tmp', targetPath, { overwrite: true });
-      } catch (resizeErr) {
-        console.error(`Icon resize failed for ${targetPath}, falling back to raw copy:`, resizeErr.message);
-        await fse.copy(iconFile.path, targetPath);
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile() && iconNamePattern.test(entry.name)) {
+        matches.push(fullPath);
       }
     }
   }
 
-  // Also cover a flat drawable fallback, if present in the template.
-  const drawableIcon = path.join(resDir, 'drawable', 'ic_launcher.png');
-  if (await fse.pathExists(drawableIcon)) {
+  await walk(dir);
+  return matches;
+}
+
+async function replaceLauncherIcon(decompiledDir, iconFile) {
+  if (!iconFile) return;
+
+  const resDir = path.join(decompiledDir, 'res');
+  const iconFiles = await findLauncherIconFiles(resDir);
+
+  if (iconFiles.length === 0) {
+    console.warn(
+      `[icon] No ic_launcher*.png files found anywhere under ${resDir}. ` +
+      `Icon was NOT replaced - the base APK's launcher icon resources may use ` +
+      `an unexpected naming scheme (e.g. adaptive icons via ic_launcher.xml).`
+    );
+    return;
+  }
+
+  console.log(`[icon] Found ${iconFiles.length} launcher icon file(s) to replace:`, iconFiles);
+
+  for (const targetPath of iconFiles) {
     try {
-      await sharp(iconFile.path).resize(96, 96, { fit: 'cover' }).png().toFile(drawableIcon + '.tmp');
-      await fse.move(drawableIcon + '.tmp', drawableIcon, { overwrite: true });
-    } catch (err) {
-      await fse.copy(iconFile.path, drawableIcon);
+      // Match the replacement to the original icon's own dimensions so we
+      // don't accidentally blow up or shrink a specific density's asset.
+      let width = 192;
+      let height = 192;
+      try {
+        const meta = await sharp(targetPath).metadata();
+        if (meta.width && meta.height) {
+          width = meta.width;
+          height = meta.height;
+        }
+      } catch (metaErr) {
+        // Original file might be corrupt/unreadable - fall back to a sane default size.
+      }
+
+      const tmpPath = targetPath + '.tmp';
+      await sharp(iconFile.path)
+        .resize(width, height, { fit: 'cover' })
+        .png()
+        .toFile(tmpPath);
+      await fse.move(tmpPath, targetPath, { overwrite: true });
+    } catch (resizeErr) {
+      console.error(`[icon] Resize failed for ${targetPath}, falling back to raw copy:`, resizeErr.message);
+      try {
+        await fse.copy(iconFile.path, targetPath, { overwrite: true });
+      } catch (copyErr) {
+        console.error(`[icon] Raw copy also failed for ${targetPath}:`, copyErr.message);
+      }
     }
   }
 }
